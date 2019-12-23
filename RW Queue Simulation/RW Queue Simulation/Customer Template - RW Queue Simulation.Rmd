@@ -6,11 +6,11 @@ author: Your name, Cogito TS
 
 
 #Executive Summary
-You have recently asked your Cogito TS to help optimize your Reporting Workbench performance through queue management. This document will provide quantitative evidence for making change(s) to your current queue structure. This methodolgy was developed by a Cogito TS and validated on multiple Epic organizations across the Epic community.
+You have recently asked your Technical Solutions Engineer to help optimize your Reporting Workbench performance through queue management. This document will provide quantitative evidence for making change(s) to your current queue structure. This methodolgy was developed by a TS and validated on multiple organizations across the community.
 
 <Make your recommendation>
 
-Any decisions made from this document should be preceded by a discussion with your Cogito TS. They can help you understand the opportunities and risks involved with queue management.
+Any decisions made from this document should be preceded by a discussion with your TS. They can help you understand the opportunities and risks involved with queue management.
 
 ```{r install, include=FALSE}
 #This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
@@ -34,9 +34,9 @@ library("ggplot2")
 ```
 
 #Methodology
-This analysis uses discrete event simulation to represent a single reporting workbench queue electronically. It can make claims about how RW *would have* performed had you taken the recommended changes prior to this analysis. It draws on two weeks of your historical RW run data. The breakdown of runs by queue can be found just below the following code snippet.
+This analysis uses discrete event simulation to represent a single reporting queue electronically. It can make claims about how *would have* performed had you taken the recommended changes prior to this analysis. It draws on two weeks of your historical run data. The breakdown of runs by queue can be found just below the following code snippet.
 
-In order to model your queues effectively, the model incorporates several important settings on your queue definition/template. This includes maximum daemons, minimum daemons and others. Refer to the Generic Queueing Menu in Text or the code snippet below for definitions and values for these parameters.
+In order to model your queues effectively, the model incorporates several important settings on your queue definition/template. This includes maximum daemons, minimum daemons and others. Refer to the code snippet below for definitions and values for these parameters.
 
 
 ```{r load, include = TRUE}
@@ -56,8 +56,7 @@ runs <- read.csv(filename)
 # is smaller than Decrement Count for Decrement Delay seconds, the daemon
 # master will stop one daemon instance.
 
-#fill in these parameters according to the info in:
-#d ^EQMENU > Queue Definitions > Edit Queue Definition > <Descriptor Name>
+#fill in these values based on your system settings
 #Note that if there is nothing filled in, it will default to the values below.
 #After running once with the actual configuration, feel free to tweak these as
 #inputs to the experiment to see how they impact wait time.
@@ -198,7 +197,7 @@ plot_df <- df1 %>% rbind(df2)
 ```
 #Validation
 
-This analysis was validated by running a simulation with your current configuration. This simulation uses the HRN start and run times as input. In the below visualization, you can see how the simulated wait times compare to the observed wait times (in HRN).
+This analysis was validated by running a simulation with your current configuration. This simulation uses the run start and run times as input. In the below visualization, you can see how the simulated wait times compare to the observed wait times.
 
 In general, we consider a model to be *validated* if the summary statistics between the simulation and actual are reasonably close and the distributions are similar in shape. There are several sources of error that the model cannot account for, which are discussed briefly later in this document. 
 

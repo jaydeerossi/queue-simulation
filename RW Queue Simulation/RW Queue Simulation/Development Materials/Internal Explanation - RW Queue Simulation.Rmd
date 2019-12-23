@@ -1,0 +1,230 @@
+---
+title: "QSim Setup & Support Guide"
+output: word_document
+author: Jack Rossi
+date: 5/2/2019
+---
+
+
+##Introduction
+I have a few goals for writing this document. For Cogito TS who want to simulate customer queues, I hope to give you the background needed to troubleshoot issues with QSim. I also hope that some of you will adapt the code to meet more use cases than initially intended. For an intrepid few of you, I hope to provide all the background needed to keep improving QSim for the wider Cogito TS contingent.
+
+##Code Documentation: Table of Contents
+1. Preprocess Data
+2. HRN Trajectory Definition
+3. Daemon Master Definitions
+4. Simulation Environment and Run
+5. Post-process Data
+6. Visualize Results
+
+
+```{r libs, include = FALSE}
+#This is an R Markdown document. #Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. The three tick (```) syntax sets off a code block and is terminated by another set of ticks. You can use the green play button at the right of any code block to run that code.
+
+#For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+#The hashtag symbol indicates a comment. You should uncomment and run the three following lines the first time you use QSim.
+#install.packages("dplyr")
+#install.packages("simmer")
+#install.packages("simmer.plot")
+
+#every time you open RStudio after X'ing out, you'll need to reload the libraries with the following commands.
+library("magrittr") #this provides the convenient pipe operation %>%
+library("simmer") #this is the Discrete event simulation engine
+library("simmer.plot") #this allows easy plotting of the simulation results
+library("dplyr") #this provides SQL-like dataframe manipulation
+library("ggplot2") #this provides further plotting capabilities
+
+```
+
+##Preprocess Data
+
+
+```{r preprocess}
+
+max_daemons <- 10 # use the <- assignment operator for these simulation variables
+min_daemons <- 1 
+incr_count <- 2  
+decr_count <- 1   
+incr_delay <- 4  
+decr_delay <- 4  
+
+filename <- "~/Simulation/lluh_queues_latency_shd.csv" #assign a string filename 
+runs <- read.csv(filename) #use that filename to load a your csv into a dataframe
+View(runs) #open up the runs dataframe so you get a feel for what it looks like
+
+summary(runs$Queue) #show the count of runs by queue
+runs <- subset(runs, Queue == "RWPRODHP") #take only the subset of runs where Queue takese some value
+
+
+
+
+warm_up <- 0 #This warm up period helps reduce bias from starting the simulation with empty queues.
+sim_duration <- 100 #run sim for Full two weeks ~ 1250000
+
+runs$Run.instant <- runs$Run.date %>% paste(runs$Run.time) %>% as.POSIXct(format = "%m/%d/%Y %H:%M:%OS") #create run instant
+runs <- subset(runs, Run.seconds >= 0) #take only subset of runs where runtime > 0
+runs[is.na(runs$Start.Latency),"Start.Latency"]<-0 #assign value of 0 to column Start.Latency where rows have NA in that column
+
+#create a new dataframe containing only the start time from the runs dataframe. The simulation must take it in this way.
+arr <- runs$Run.instant %>% as.numeric() %>% data.frame()
+names(arr)[1] <- "time" #give the single column a suitable name
+#create a new column in that dataframe for the total time a run occupies a daemon (service time)
+arr$service <- runs$Run.seconds + runs$Start.Latency 
+
+#the following two lines are requirements for the simulation package
+arr$time <- arr$time - min(arr$time) #normalize the start times so that the first arrival is at time 0
+arr <- arrange(arr,time) #order the arrival dataframe by time so that the earliest runs appear first
+
+#for debugging purposes, create a known dataframe of runs
+arr <- data.frame(time=c(0,0,0,15),service=c(10,10,10,10))
+
+```
+##HRN Trajectory Definition
+
+```{r hrn_trajectory}
+#initialize the simulation environment. This will be 
+env <- simmer(verbose = FALSE)
+
+#Logic for whether or not to send a increment/decrement signal
+check_queue <- function(.trj, resource, mod, lim_queue, lim_server) {
+  .trj %>% branch(
+    function() {
+      #if queue meets criteria to increment/decrement
+      if (get_queue_count(env, resource) == lim_queue[2] &&
+          get_capacity(env, resource)    != lim_server)  
+        return(2) #then send a signal to increment/decrement
+      #if the queue meets the opposite criteria, cancel previous incr/decr signal
+      if (get_queue_count(env, resource) == lim_queue[1])  
+        return(1)
+      0 # pass
+    },
+    continue = c(TRUE, TRUE),
+    trajectory() %>% send(paste("cancel", mod[1])), 
+    trajectory() %>% send(mod[2])
+  )
+}
+
+#trajectory for RW runs
+main <- trajectory() %>%
+  log_(function(){paste("arrived! The queue is now at ",get_queue_count(env,"resource")+1)}) %>%
+     #must add 1 because this arrival not technically in the queue yet
+  check_queue("resource", c("-", "+"), c(decr_count, incr_count-1), max_daemons) %>% #send incr_count-1 for same reason
+  seize("resource") %>%
+  log_(function() {paste("Just seized daemon, queue is now at ",get_queue_count(env,"resource"))}) %>%
+  timeout_from_attribute("service") %>%
+  check_queue("resource", c("+", "-"), c(incr_count-1, decr_count), min_daemons) %>%
+  release("resource") %>%
+  log_(function() {paste("Leaving when the queue is at ",get_queue_count(env,"resource"))}) %>%
+  log_(function() {paste("And the number of daemons is ",get_capacity(env,"resource"))})
+  
+  
+```
+
+##Daemon Master Definitions
+
+```{r daemon_master}
+#handling of increment/decrement signals
+change_capacity <- function(resource, mod, delay, limit) {
+  trajectory() %>%
+    untrap(paste("cancel", mod)) %>%
+    trap(mod) %>%
+    wait() %>%
+    # signal received
+    untrap(mod) %>%
+    trap(paste("cancel", mod),
+         handler = trajectory() %>%
+           log_("cancelled! start from the beginning") %>%
+           rollback(Inf)) %>%
+    timeout(delay) %>%
+    set_capacity(resource, as.numeric(paste0(mod, 1)), mod="+") %>%
+    log_(function () 
+      {paste(mod,"1 daemon at time ",
+             as.character(now(env)),
+             " with queue =",
+             get_queue_count(env,resource)+1,
+             "; Daemon count now",
+             get_capacity(env,resource))}) %>%
+    # do we need to keep changing the capacity?
+    rollback(3, check=function() { (get_capacity(env, resource) != limit) && 
+                                  (as.numeric(paste0(mod,get_queue_count(env, resource))) > as.numeric(paste0(mod,limit)))
+                                  }) %>%
+    # start from the beginning
+    rollback(Inf) 
+}
+
+incr_capacity <- change_capacity("resource", "+", incr_delay, max_daemons)
+decr_capacity <- change_capacity("resource", "-", decr_delay, min_daemons)
+
+```
+
+##Simulation Environment and Run
+
+```{r simulation}
+env %>%
+  #add you initial number of daemons
+  add_resource("resource", min_daemons) %>%
+  #add the process to monitor increases
+  add_generator("incr", incr_capacity, at(0)) %>%
+  #add another process to monitor decreases
+  add_generator("decr", decr_capacity, at(0)) %>%
+  add_dataframe("arrival", main, arr, time = "absolute") %>%
+    run(sim_duration)
+```
+##Post-Process Data
+
+```{r postprocessing}
+#fetch results from the mon(itor)
+resources <- get_mon_resources(env) #daemon-perspective results
+arrivals <- get_mon_arrivals(env) #hrn-perspective results
+
+
+
+
+
+
+
+#Perform  required post processing
+runs$ID <- seq.int(nrow(runs))
+runs$source <- "Actual"
+
+
+arrivals$ID <- seq.int(nrow(arrivals))
+arrivals$source <- "Sim"
+
+#Match HRNs in historical data to arrivals in simulation stats
+matched <- merge(runs, arrivals, by="ID") 
+
+#simulated wait time is actual wait time + start.Latency. The queue is seized at this point but still counted as wait time in HRN
+matched$sim_waits <- matched$end_time - matched$start_time - matched$activity_time  + matched$Start.Latency
+
+matched <- subset(matched, start_time >= warm_up)
+
+#combine sim and actual data into single dataframe for plotting
+df2 <- data.frame(matched$sim_waits,matched$source.y)
+df1 <- data.frame(runs$Wait.seconds,runs$source)
+colnames(df1) <- c("Wait.Time","Source")
+colnames(df2) <- c("Wait.Time","Source")
+plot_df <- df1 %>% rbind(df2)
+
+```
+
+
+##Visualize Results
+```{r visualize}
+
+#Plotting the distribution of wait times on two plots
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) +facet_grid(Source ~ .) 
+
+# - and on same plot. You may need to change xlim() and ylim() parameters for better viewing
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) #+ xlim(-5,17) #+ylim(0,1000)
+
+print("Actual")
+summary(runs$Wait.seconds)
+print("Sim")
+summary(matched$sim_waits)
+
+plot(arrivals, metric = "waiting_time")
+```

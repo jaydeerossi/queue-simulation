@@ -1,0 +1,330 @@
+---
+title: "Queues Visualization"
+output: word_document
+author: Your name, Cogito TS
+---
+
+
+#Executive Summary
+You have recently asked your Cogito TS to help optimize your Reporting Workbench performance through queue management. This document will provide quantitative evidence for making change(s) to your current queue structure. This methodolgy was developed by a Cogito TS and validated on multiple Epic organizations across the Epic community.
+
+<Make your recommendation>
+
+Any decisions made from this document should be preceded by a discussion with your Cogito TS. They can help you understand the opportunities and risks involved with queue management.
+
+```{r install, include=FALSE}
+#This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+#When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+#install.packages("dplyr")
+#install.packages("simmer")
+#install.packages("simmer.plot")
+
+```
+
+```{r libs, include = FALSE}
+
+library("magrittr")
+library("simmer")
+library("simmer.plot")
+library("dplyr")
+library("ggplot2")
+
+```
+
+#Methodology
+This analysis uses discrete event simulation to represent a single reporting workbench queue electronically. It can make claims about how RW *would have* performed had you taken the recommended changes prior to this analysis. It draws on two weeks of your historical RW run data. The breakdown of runs by queue can be found just below the following code snippet.
+
+In order to model your queues effectively, the model incorporates several important settings on your queue definition/template. This includes maximum daemons, minimum daemons and others. Refer to the Generic Queueing Menu in Text or the code snippet below for definitions and values for these parameters.
+
+
+```{r load, include = TRUE}
+#load the file from your documents folder by copying after the first '/'
+#Alternatively, the R Studio "Import Dataset" tool can be used. Just make sure to rename your dataframe to "runs".
+filename = "~/Simulation/ac_queues_latency.csv"
+runs <- read.csv(filename)
+
+#~~PARAMETER DEFINITIONS~~
+# If the number of running daemons for a queue is less than the Maximum
+# Number allowed, and the number of unprocessed entries in the queue is
+# larger than or equal to Increment Count for Increment Delay seconds,
+# the daemon master will start another daemon instance.
+
+# If the number of running daemons for a queue is greater than the Minimum
+# Number allowed, and the number of unprocessed entries in the queue
+# is smaller than Decrement Count for Decrement Delay seconds, the daemon
+# master will stop one daemon instance.
+
+#fill in these parameters according to the info in:
+#d ^EQMENU > Queue Definitions > Edit Queue Definition > <Descriptor Name>
+#Note that if there is nothing filled in, it will default to the values below.
+#After running once with the actual configuration, feel free to tweak these as
+#inputs to the experiment to see how they impact wait time.
+max_daemons = 2 #default: 5
+min_daemons = 2 #default: 2
+incr_count = 5   #default: 5
+decr_count = 2   #default: 2
+incr_delay = 10  #default: 10
+decr_delay = 10  #default: 10
+
+```
+```{r manipulate, include = FALSE}
+
+##Do your configuration. You should at minimum filter the dataframe to just one queue.
+#You can get a feel for any of the columns of your dataframe using summary
+summary(runs$Queue)
+runs <- subset(runs, Queue == "RWPROD")
+
+#~~Example: Simulate putting a queue override on a template to move it to a new queue
+#runs <- subset(runs, Queue == "YYYY" | HGR.name == "Template Name")
+
+#Filter by HGR name using regular expressions. Cheatsheet -> https://www.rstudio.com/wp-content/uploads/2016/09/RegExCheatsheet.pdf
+```
+
+
+```{r simulation, include = FALSE}
+#You can likely leave this as is. This helps reduce bias from starting the simulation with empty queues.
+warm_up = 0 #in seconds.
+#this is additional required manipulation to remove negative runtimes, latencies of NA, and format dates.
+runs <- subset(runs, Run.seconds >= 0)
+
+
+runs[is.na(runs$Start.Latency),"Start.Latency"]<-0
+runs[runs$From.batch. == "Yes","Start.Latency"]<-0
+runs$Run.instant <- runs$Run.date %>% paste(runs$Run.time) %>% as.POSIXct(format = "%m/%d/%Y %H:%M:%OS")
+
+#runs$Run.instant <- as.POSIXct(paste(runs$Run.date,runs$Run.time), format = "%m/%d/%Y %H:%M:%OS")
+
+
+
+#create arr dataframe for use in simulation
+arr <- runs$Run.instant %>% as.numeric() %>% data.frame()
+arr$service <- runs$Run.seconds + runs$Start.Latency
+names(arr)[1] <- "time"
+arr$time <- arr$time - min(arr$time)
+arr <- arrange(arr,time)
+
+env <- simmer()
+
+#Logic for whether or not to send a increment/decrement signal
+check_queue <- function(.trj, resource, mod, lim_queue, lim_server) {
+  .trj %>% branch(
+    function() {
+      if (get_queue_count(env, resource) == lim_queue[1])
+        return(1)
+      if (get_queue_count(env, resource) == lim_queue[2] &&
+          get_capacity(env, resource)    != lim_server)
+        return(2)
+      0 # pass
+    },
+    continue = c(TRUE, TRUE),
+    trajectory() %>% send(paste("cancel", mod[1])),
+    trajectory() %>% send(mod[2])
+  )
+}
+
+#trajectory for RW runs
+main <- trajectory() %>%
+  check_queue("resource", c("-", "+"), c(decr_count, incr_count-1), max_daemons) %>%
+  #timeout_from_attribute("shadow") %>%
+  seize("resource") %>%
+  check_queue("resource", c("+", "-"), c(incr_count-1, decr_count), min_daemons) %>%
+  timeout_from_attribute("service") %>%
+  release("resource")
+
+#handling of increment/decrement signals
+change_capacity <- function(resource, mod, delay, limit) {
+  trajectory() %>%
+    untrap(paste("cancel", mod)) %>%
+    trap(mod) %>%
+    wait() %>%
+    # signal received
+    untrap(mod) %>%
+    trap(paste("cancel", mod),
+         handler = trajectory() %>%
+           # cancelled! start from the beginning
+           rollback(Inf)) %>%
+    timeout(delay) %>%
+    set_capacity(resource, as.numeric(paste0(mod, 1)), mod="+") %>%
+    #log_("Logging change to capacity") %>%
+    # do we need to keep changing the capacity?
+    rollback(2, check=function() { (get_capacity(env, resource) != limit) && 
+                                  (as.numeric(paste0(mod,get_queue_count(env, resource))) > as.numeric(paste0(mod,limit)))
+                                  }) %>%
+    # start from the beginning
+    rollback(Inf) 
+}
+
+incr_capacity <- change_capacity("resource", "+", incr_delay, max_daemons)
+decr_capacity <- change_capacity("resource", "-", decr_delay, min_daemons)
+
+env %>%
+  add_resource("resource", min_daemons) %>%
+  #add the process to monitor increases
+  add_generator("incr", incr_capacity, at(0)) %>%
+  #add another process to monitory decreases
+  add_generator("decr", decr_capacity, at(0)) %>%
+  add_dataframe("arrival", main, arr, time = "absolute") %>%
+    run(1250000) #run sim for Full two weeks - 1209600
+
+#fetch all simulation results
+resources <- get_mon_resources(env)
+attributes <- get_mon_attributes(env) 
+arrivals <- get_mon_arrivals(env) 
+
+#Perform  required post processing
+runs$ID <- seq.int(nrow(runs))
+runs$source <- "Actual"
+
+
+arrivals$ID <- seq.int(nrow(arrivals))
+arrivals$source <- "Sim"
+
+#Match HRNs in historical data to arrivals in simulation stats
+matched <- merge(runs, arrivals, by="ID") 
+
+#simulated wait time is actual wait time + start.Latency. The queue is seized at this point but still counted as wait time in HRN
+matched$sim_waits <- matched$end_time - matched$start_time - matched$activity_time  + matched$Start.Latency
+
+matched <- subset(matched, start_time >= warm_up)
+
+#combine sim and actual data into single dataframe for plotting
+df2 <- data.frame(matched$sim_waits,matched$source.y)
+df1 <- data.frame(runs$Wait.seconds,runs$source)
+colnames(df1) <- c("Wait.Time","Source")
+colnames(df2) <- c("Wait.Time","Source")
+plot_df <- df1 %>% rbind(df2)
+```
+#Validation
+
+This analysis was validated by running a simulation with your current configuration. This simulation uses the HRN start and run times as input. In the below visualization, you can see how the simulated wait times compare to the observed wait times (in HRN).
+
+In general, we consider a model to be *validated* if the summary statistics between the simulation and actual are reasonably close and the distributions are similar in shape. There are several sources of error that the model cannot account for, which are discussed briefly later in this document. 
+
+
+```{r plots1, echo = FALSE, warning = FALSE, message = FALSE}
+
+#Plotting the distribution of wait times on two plots
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) +facet_grid(Source ~ .) 
+
+# - and on same plot. You may need to change xlim() and ylim() parameters for better viewing
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) #+ xlim(-5,17) #+ylim(0,1000)
+
+print("Actual")
+summary(runs$Wait.seconds)
+print("Sim")
+summary(matched$sim_waits)
+
+plot(arrivals, metric = "waiting_time")
+```
+
+<Add a couple sentences about the goodness of fit and any trends you see fit>
+
+#Experimentation
+
+Now that the model is validated, we can change the simulation parameters to see how queue configuration would affect the wait time. one suggested experiment is to change the maximum and minimum daemons or other queue parameters. You can see how moving runs between queues would affect performance, or you can create a new queue from scratch.
+
+<Add a couple sentences about your chosen experiment>
+
+```{r experiment, include = TRUE}
+
+#reload a fresh data set
+runs <- read.csv(filename)
+
+max_daemons = 1 #default: 5
+min_daemons = 1  #default: 2
+incr_count = 5   #default: 5
+decr_count = 2   #default: 2
+incr_delay = 10  #default: 10
+decr_delay = 10  #default: 10
+
+##Do your configuration. You should at minimum filter the dataframe to just one queue.
+#You can get a feel for any of the columns of your dataframe using summary
+runs <- subset(runs, Queue == "RWPROD")
+
+#~~Example: Simulate putting a queue override on a template to move it to a new queue
+#runs <- subset(runs, Queue == "YYYY" | HGR.name == "Template Name")
+
+#Filter by HGR name using regular expressions. Cheatsheet -> https://www.rstudio.com/wp-content/uploads/2016/09/RegExCheatsheet.pdf
+
+#~~Idea: simulate increasing your batch's frequency. Props to the person who figures this out :)
+```
+
+```{r run_experiment, include = FALSE}
+
+#this is additional required manipulation to remove negative runtimes, latencies of NA, and format dates.
+runs <- subset(runs, Run.seconds >= 0)
+runs[is.na(runs$Start.Latency),"Start.Latency"]<-0
+runs[runs$From.batch. == "Yes","Start.Latency"]<-0
+runs$Run.instant <- runs$Run.date %>% paste(runs$Run.time) %>% as.POSIXct(format = "%m/%d/%Y %H:%M:%OS")
+
+#create arr dataframe for use in simulation
+arr <- runs$Run.instant %>% as.numeric() %>% data.frame()
+arr$service <- runs$Run.seconds + runs$Start.Latency
+names(arr)[1] <- "time"
+arr$time <- arr$time - min(arr$time)
+arr <- arrange(arr,time)
+
+exp <- simmer()
+
+exp %>%
+  add_resource("resource", min_daemons) %>%
+  #add the process to monitor increases
+  add_generator("incr", incr_capacity, at(0)) %>%
+  #add another process to monitory decreases
+  add_generator("decr", decr_capacity, at(0)) %>%
+  add_dataframe("arrival", main, arr, time = "absolute") %>%
+    run(1250000) #run sim for Full two weeks
+
+#fetch all simulation results
+resources <- get_mon_resources(exp)
+attributes <- get_mon_attributes(exp) 
+arrivals <- get_mon_arrivals(exp) 
+
+#Perform  required post processing
+runs$ID <- seq.int(nrow(runs))
+runs$source <- "Actual"
+arrivals$ID <- seq.int(nrow(arrivals))
+arrivals$source <- "Sim"
+
+#Match HRNs in historical data to arrivals in simulation stats
+matched <- merge(runs, arrivals, by="ID") 
+
+#simulated wait time is actual wait time + start.Latency. The queue is seized at this point but still counted as wait time in HRN
+matched$sim_waits <- matched$end_time - matched$start_time - matched$activity_time  + matched$Start.Latency
+
+matched <- subset(matched, start_time >= warm_up)
+
+#combine sim and actual data into single dataframe for plotting
+df2 <- data.frame(matched$sim_waits,matched$source.y)
+df1 <- data.frame(runs$Wait.seconds,runs$source)
+colnames(df1) <- c("Wait.Time","Source")
+colnames(df2) <- c("Wait.Time","Source")
+plot_df <- df1 %>% rbind(df2)
+
+
+```
+
+```{r plots2, echo = FALSE, warning = FALSE, message = FALSE}
+
+#Plotting the distribution of wait times on two plots
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) +facet_grid(Source ~ .) 
+
+# - and on same plot. You may need to change xlim() and ylim() parameters for better viewing
+ggplot(plot_df, aes(Wait.Time, fill=Source)) + 
+  geom_histogram(position="identity", colour="grey40", alpha=0.5) #+ xlim(-5,17) #+ylim(0,1000)
+
+print("Actual Initial")
+summary(runs$Wait.seconds)
+print("Projected Final")
+summary(matched$sim_waits)
+
+plot(arrivals, metric = "waiting_time")
+```
+
+#Recommendations
+<Your recommendations go here>

@@ -1,7 +1,7 @@
 ---
 title: "Queues Visualization"
 output: word_document
-author: Your name, Cogito TS
+author: Your name, TS name
 ---
 
 
